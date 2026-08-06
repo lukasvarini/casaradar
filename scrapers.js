@@ -1,5 +1,7 @@
-/* scrapers.js — interrogazione portali con Playwright + screenshot fallback */
+/* scrapers.js — interrogazione reale dei portali con Playwright + screenshot fallback */
 const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 let browserPromise = null;
@@ -14,25 +16,41 @@ function getBrowser() {
   return browserPromise;
 }
 
+/* Cartella screenshot di fallback (servita da express static) */
+const SHOTS_DIR = path.join(__dirname, 'public', 'shots');
+fs.mkdirSync(SHOTS_DIR, { recursive: true });
+try {
+  for (const f of fs.readdirSync(SHOTS_DIR)) {
+    const p = path.join(SHOTS_DIR, f);
+    if (Date.now() - fs.statSync(p).mtimeMs > 3600e3) fs.unlinkSync(p); // pulisce dopo 1h
+  }
+} catch (e) {}
+
 const q = o => {
-  const s = Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+  const s = Object.entries(o).filter(([, v]) => v != null && v !== '').map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
   return s ? '?' + s : '';
 };
 
+/* NOTA: per indirizzi specifici (via/piazza) la ricerca avviene sulla città risolta
+   da OpenStreetMap, perché i portali non espongono filtri "via" affidabili via URL. */
 const PORTALS = [
   { id: 'immobiliare', name: 'Immobiliare.it',
     url: f => `https://www.immobiliare.it/${f.contract === 'vendita' ? 'vendita' : 'affitto'}-case/${f.city}/` +
-      q({ prezzoMinimo: f.priceMin, prezzoMassimo: f.priceMax, superficieMinima: f.surfaceMin,
-          numeroLocaliMinimo: f.roomsMin > 1 ? f.roomsMin : null, numeroBagniMinimo: f.bathsMin > 1 ? f.bathsMin : null }) },
+      q({ prezzoMinimo: f.priceMin, prezzoMassimo: f.priceMax, superficieMinima: f.surfaceMin, superficieMassima: f.surfaceMax, numeroLocaliMinimo: f.rooms > 1 ? f.rooms : null }) },
   { id: 'idealista', name: 'Idealista',
-    url: f => { const seg = []; if (f.priceMax) seg.push(`con-prezzo-fino-a-${f.priceMax}`); if (f.surfaceMin) seg.push(`superficie-minima-${f.surfaceMin}`);
-      return `https://www.idealista.it/${f.contract === 'vendita' ? 'vendita' : 'affitto'}/residenziali/${f.city}/` + (seg.length ? seg.join(',') + '/' : ''); } },
+    url: f => {
+      const seg = [];
+      if (f.priceMax) seg.push(`con-prezzo-fino-a-${f.priceMax}`);
+      if (f.priceMin) seg.push(`con-prezzo-a-partire-da-${f.priceMin}`);
+      if (f.surfaceMin) seg.push(`superficie-minima-${f.surfaceMin}`);
+      return `https://www.idealista.it/${f.contract === 'vendita' ? 'vendita' : 'affitto'}/residenziali/${f.city}/` + (seg.length ? seg.join(',') + '/' : '');
+    } },
   { id: 'casa', name: 'Casa.it',
     url: f => `https://www.casa.it/${f.contract === 'vendita' ? 'vendita' : 'affitto'}/residenziale/${f.city}` +
-      q({ priceMin: f.priceMin, priceMax: f.priceMax, surfaceMin: f.surfaceMin, roomsMin: f.roomsMin > 1 ? f.roomsMin : null }) },
+      q({ priceMin: f.priceMin, priceMax: f.priceMax, surfaceMin: f.surfaceMin, roomsMin: f.rooms > 1 ? f.rooms : null }) },
   { id: 'wikicasa', name: 'Wikicasa',
     url: f => `https://www.wikicasa.it/${f.contract === 'vendita' ? 'vendita' : 'affitto'}/case/${f.city}/` +
-      q({ prezzoMinimo: f.priceMin, prezzoMassimo: f.priceMax, superficieMinima: f.surfaceMin, localiMinimo: f.roomsMin > 1 ? f.roomsMin : null }) },
+      q({ prezzoMinimo: f.priceMin, prezzoMassimo: f.priceMax, superficieMinima: f.surfaceMin, localiMinimo: f.rooms > 1 ? f.rooms : null }) },
   { id: 'subito', name: 'Subito.it',
     url: f => `https://www.subito.it/annunci-${f.region || 'lombardia'}/${f.contract}/immobili/${f.city}/` +
       q({ price_min: f.priceMin, price_max: f.priceMax, surface_min: f.surfaceMin }) },
@@ -40,13 +58,8 @@ const PORTALS = [
     url: f => `https://${f.city}.bakeca.it/immobili/` }
 ];
 
-/* Parser robusto: forza scroll per attivare lazy-load, cattura immagini + screenshot fallback */
+/* Parser generico eseguito dentro la pagina: robusto ai cambi di classi CSS */
 function extractInPage({ origin, max }) {
-  // Forza lazy-load scrollando
-  window.scrollTo(0, document.body.scrollHeight / 3);
-  window.scrollTo(0, (document.body.scrollHeight * 2) / 3);
-  window.scrollTo(0, document.body.scrollHeight);
-
   const SELS = ['li', 'article', '[class*="card" i]', '[class*="listing" i]', '[class*="item" i]', '[class*="result" i]', '[class*="announcement" i]'];
   let cands = [];
   for (const s of SELS) {
@@ -71,6 +84,78 @@ function extractInPage({ origin, max }) {
     seen.add(href);
     const sm = t.match(/(\d{1,4})\s*(?:m²|mq)/i);
     const rm = t.match(/(\d{1,2})\s*(?:local[ie]|van[io]|stanz|camere)/i);
-    const bm = t.match(/(\d{1,2})\s*(?:bagn[io])/i);
-    const fm = t.match(/piano\s*([tT1-9]|terra|rialzato|sotterraneo|seminterrato|attico|ultimo)/i);
-    const em = t.match(/classe\s+energetic[ae]\s*
+    const h = el.querySelector('h2,h3,h4,[class*="title" i]');
+    let title = h ? h.innerText.trim() : '';
+    if (title.length < 8) title = (t.split(/[-–|·•]/).find(x => x.trim().length > 16 && !x.includes('€')) || 'Annuncio immobiliare').trim();
+    const img = el.querySelector('img[src],img[data-src]');
+    const src = img ? (img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src')) : null;
+    el.setAttribute('data-cr-idx', String(out.length)); // marker per screenshot fallback
+    out.push({
+      price, title: title.slice(0, 110),
+      surface: sm ? Math.min(5000, +sm[1]) : null,
+      rooms: rm ? Math.min(15, +rm[1]) : null,
+      url: href, img: src && /^https?:/.test(src) ? src.split('?')[0] : null,
+      raw: t.slice(0, 300)
+    });
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+async function scrapePortal(p, f, delay) {
+  const t0 = Date.now();
+  const base = { portal: p.id, name: p.name, ok: false, listings: [], error: null, ms: 0 };
+  let ctx;
+  try {
+    const b = await getBrowser();
+    ctx = await b.newContext({ userAgent: UA, locale: 'it-IT', viewport: { width: 1366, height: 900 } });
+    const page = await ctx.newPage();
+    await new Promise(r => setTimeout(r, delay));
+    await page.goto(p.url(f), { waitUntil: 'domcontentloaded', timeout: 25000 });
+    await page.waitForTimeout(1800 + Math.random() * 1500);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2)).catch(() => {});
+    await page.waitForTimeout(700);
+    const origin = new URL(p.url(f)).origin;
+    const items = await page.evaluate(extractInPage, { origin, max: 15 });
+
+    /* SCREENSHOT FALLBACK: solo per i primi 2 annunci senza immagine */
+    const noImg = items.map((x, i) => x.img ? null : i).filter(v => v != null).slice(0, 2);
+    for (const i of noImg) {
+      try {
+        const h = await page.$(`[data-cr-idx="${i}"]`);
+        if (h) {
+          const buf = await h.screenshot({ type: 'jpeg', quality: 60, timeout: 8000 });
+          const fname = `shot_${Date.now()}_${p.id}_${i}.jpg`;
+          fs.writeFileSync(path.join(SHOTS_DIR, fname), buf);
+          items[i].img = '/shots/' + fname;
+          items[i].shot = true;
+        }
+      } catch (e) {}
+    }
+
+    base.ok = items.length > 0;
+    base.listings = items.map(x => ({ ...x, portal: p.id }));
+    if (!base.ok) base.error = 'nessun annuncio leggibile';
+  } catch (e) {
+    base.error = ((e && e.message) || 'errore').split('\n')[0].slice(0, 70);
+  } finally {
+    if (ctx) await ctx.close().catch(() => {});
+  }
+  base.ms = Date.now() - t0;
+  return base;
+}
+
+async function searchAll(f) {
+  const t0 = Date.now();
+  const res = await Promise.allSettled(PORTALS.map((p, i) => scrapePortal(p, f, i * 500)));
+  const portals = [], listings = [];
+  res.forEach((r, i) => {
+    const d = r.status === 'fulfilled' ? r.value
+      : { portal: PORTALS[i].id, name: PORTALS[i].name, ok: false, listings: [], error: 'crash', ms: 0 };
+    portals.push({ id: d.portal, ok: d.ok, count: d.listings.length, error: d.error, ms: d.ms });
+    listings.push(...d.listings);
+  });
+  return { city: f.city, contract: f.contract, ts: Date.now(), ms: Date.now() - t0, portals, listings };
+}
+
+module.exports = { searchAll };
