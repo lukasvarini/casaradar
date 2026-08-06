@@ -1,4 +1,4 @@
-/* scrapers.js — interrogazione reale dei portali nazionali con Playwright */
+/* scrapers.js — interrogazione portali con Playwright + screenshot fallback */
 const { chromium } = require('playwright');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -19,11 +19,11 @@ const q = o => {
   return s ? '?' + s : '';
 };
 
-/* Deep-link di ricerca per ciascun portale */
 const PORTALS = [
   { id: 'immobiliare', name: 'Immobiliare.it',
     url: f => `https://www.immobiliare.it/${f.contract === 'vendita' ? 'vendita' : 'affitto'}-case/${f.city}/` +
-      q({ prezzoMinimo: f.priceMin, prezzoMassimo: f.priceMax, superficieMinima: f.surfaceMin, numeroLocaliMinimo: f.roomsMin > 1 ? f.roomsMin : null }) },
+      q({ prezzoMinimo: f.priceMin, prezzoMassimo: f.priceMax, superficieMinima: f.surfaceMin,
+          numeroLocaliMinimo: f.roomsMin > 1 ? f.roomsMin : null, numeroBagniMinimo: f.bathsMin > 1 ? f.bathsMin : null }) },
   { id: 'idealista', name: 'Idealista',
     url: f => { const seg = []; if (f.priceMax) seg.push(`con-prezzo-fino-a-${f.priceMax}`); if (f.surfaceMin) seg.push(`superficie-minima-${f.surfaceMin}`);
       return `https://www.idealista.it/${f.contract === 'vendita' ? 'vendita' : 'affitto'}/residenziali/${f.city}/` + (seg.length ? seg.join(',') + '/' : ''); } },
@@ -40,9 +40,13 @@ const PORTALS = [
     url: f => `https://${f.city}.bakeca.it/immobili/` }
 ];
 
-/* Parser generico eseguito DENTRO la pagina: robusto ai cambi di classi CSS.
-   Cerca blocchi contenenti un prezzo in €, un link-annuncio, metratura e locali. */
+/* Parser robusto: forza scroll per attivare lazy-load, cattura immagini + screenshot fallback */
 function extractInPage({ origin, max }) {
+  // Forza lazy-load scrollando
+  window.scrollTo(0, document.body.scrollHeight / 3);
+  window.scrollTo(0, (document.body.scrollHeight * 2) / 3);
+  window.scrollTo(0, document.body.scrollHeight);
+
   const SELS = ['li', 'article', '[class*="card" i]', '[class*="listing" i]', '[class*="item" i]', '[class*="result" i]', '[class*="announcement" i]'];
   let cands = [];
   for (const s of SELS) {
@@ -67,61 +71,6 @@ function extractInPage({ origin, max }) {
     seen.add(href);
     const sm = t.match(/(\d{1,4})\s*(?:m²|mq)/i);
     const rm = t.match(/(\d{1,2})\s*(?:local[ie]|van[io]|stanz|camere)/i);
-    const h = el.querySelector('h2,h3,h4,[class*="title" i]');
-    let title = h ? h.innerText.trim() : '';
-    if (title.length < 8) title = (t.split(/[-–|·•]/).find(x => x.trim().length > 16 && !x.includes('€')) || 'Annuncio immobiliare').trim();
-    const img = el.querySelector('img[src],img[data-src]');
-    const src = img ? (img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src')) : null;
-    out.push({
-      price, title: title.slice(0, 110),
-      surface: sm ? Math.min(5000, +sm[1]) : null,
-      rooms: rm ? Math.min(15, +rm[1]) : null,
-      url: href, img: src && /^https?:/.test(src) ? src : null,
-      raw: t.slice(0, 300)
-    });
-    if (out.length >= max) break;
-  }
-  return out;
-}
-
-async function scrapePortal(p, f, delay) {
-  const t0 = Date.now();
-  const base = { portal: p.id, name: p.name, ok: false, listings: [], error: null, ms: 0 };
-  let ctx;
-  try {
-    const b = await getBrowser();
-    ctx = await b.newContext({ userAgent: UA, locale: 'it-IT', viewport: { width: 1366, height: 900 } });
-    const page = await ctx.newPage();
-    await new Promise(r => setTimeout(r, delay));                       // richieste sfalsate
-    await page.goto(p.url(f), { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await page.waitForTimeout(1800 + Math.random() * 1500);             // ritmo umano
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight / 2)).catch(() => {});
-    await page.waitForTimeout(700);                                     // lazy-load immagini
-    const origin = new URL(p.url(f)).origin;
-    const items = await page.evaluate(extractInPage, { origin, max: 15 });
-    base.ok = items.length > 0;
-    base.listings = items.map(x => ({ ...x, portal: p.id }));
-    if (!base.ok) base.error = 'nessun annuncio leggibile';
-  } catch (e) {
-    base.error = (e && e.message || 'errore').split('\n')[0].slice(0, 70);
-  } finally {
-    if (ctx) await ctx.close().catch(() => {});
-  }
-  base.ms = Date.now() - t0;
-  return base;
-}
-
-async function searchAll(f) {
-  const t0 = Date.now();
-  const res = await Promise.allSettled(PORTALS.map((p, i) => scrapePortal(p, f, i * 500)));
-  const portals = [], listings = [];
-  res.forEach((r, i) => {
-    const d = r.status === 'fulfilled' ? r.value
-      : { portal: PORTALS[i].id, name: PORTALS[i].name, ok: false, listings: [], error: 'crash', ms: 0 };
-    portals.push({ id: d.portal, ok: d.ok, count: d.listings.length, error: d.error, ms: d.ms });
-    listings.push(...d.listings);
-  });
-  return { city: f.city, contract: f.contract, ts: Date.now(), ms: Date.now() - t0, portals, listings };
-}
-
-module.exports = { searchAll };
+    const bm = t.match(/(\d{1,2})\s*(?:bagn[io])/i);
+    const fm = t.match(/piano\s*([tT1-9]|terra|rialzato|sotterraneo|seminterrato|attico|ultimo)/i);
+    const em = t.match(/classe\s+energetic[ae]\s*
