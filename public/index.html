@@ -571,8 +571,8 @@ footer b{color:var(--ink)}
     <div class="fgroup">
       <h4>Prezzo <em id="priceUnit">€</em></h4>
       <div class="numrow">
-        <div class="numin"><label>Min</label><input type="number" id="priceMin" placeholder="0" min="0"></div>
-        <div class="numin"><label>Max</label><input type="number" id="priceMax" placeholder="∞" min="0"></div>
+        <div class="numin"><label>Min</label><input type="number" id="priceMin" placeholder="0" min="0" autocomplete="off"></div>
+        <div class="numin"><label>Max</label><input type="number" id="priceMax" placeholder="∞" min="0" autocomplete="off"></div>
       </div>
     </div>
 
@@ -813,6 +813,9 @@ ci.addEventListener('blur',()=>setTimeout(()=>ac.classList.remove('open'),220));
 document.getElementById('cityClear').onclick=()=>{ci.value='';cf.classList.remove('has-value');ac.classList.remove('open');ci.focus()};
 
 /* ============== FILTRI ============== */
+// Flag per prevenire loop di rendering durante la digitazione
+let isApplying = false;
+
 function buildTypoChips(){
   document.getElementById('typoChips').innerHTML=TYPOS.map(t=>
     `<button class="chip${state.typs.has(t[0])?' on':''}" data-t="${t[0]}">${t[0]}</button>`
@@ -899,26 +902,41 @@ document.querySelector('[data-f="onlyDeals"]').onclick=e=>{state.onlyDeals=!stat
 document.querySelector('[data-f="onlyNew"]').onclick=e=>{state.onlyNew=!state.onlyNew;syncOptions();apply()};
 document.getElementById('btnFav').onclick=()=>{state.favOnly=!state.favOnly;syncOptions();apply()};
 
-// Prezzo: debounce separato, NON tocchiamo mai .value durante apply
-let priceDeb=null;
-function readPrices(){
-  const a=document.getElementById('priceMin').value.trim();
-  const b=document.getElementById('priceMax').value.trim();
-  state.priceMin=a?+a:null;
-  state.priceMax=b?+b:null;
+// ===== PREZZO: GESTIONE ROBUSTA (NO RESET) =====
+// Usa 'change' (al blur o invio) + debounce lungo per evitare race condition
+let priceDebounce = null;
+function updatePriceState() {
+  const minVal = document.getElementById('priceMin').value;
+  const maxVal = document.getElementById('priceMax').value;
+  state.priceMin = minVal && !isNaN(+minVal) ? +minVal : null;
+  state.priceMax = maxVal && !isNaN(+maxVal) ? +maxVal : null;
   apply();
 }
-document.getElementById('priceMin').addEventListener('input',()=>{
-  clearTimeout(priceDeb);priceDeb=setTimeout(readPrices,400);
+
+// Su input: aggiorna solo lo stato dopo 600ms di pausa, MAI toccare il DOM degli input
+document.getElementById('priceMin').addEventListener('input', () => {
+  clearTimeout(priceDebounce);
+  priceDebounce = setTimeout(updatePriceState, 600);
 });
-document.getElementById('priceMax').addEventListener('input',()=>{
-  clearTimeout(priceDeb);priceDeb=setTimeout(readPrices,400);
+document.getElementById('priceMax').addEventListener('input', () => {
+  clearTimeout(priceDebounce);
+  priceDebounce = setTimeout(updatePriceState, 600);
 });
 
-document.getElementById('surfaceMin').addEventListener('input',e=>{
-  state.surfaceMin=+e.target.value;
-  document.getElementById('surfOut').textContent=state.surfaceMin?state.surfaceMin+'+ m²':'qualsiasi';
-  apply();
+// Su change (blur/invio): applica immediatamente
+document.getElementById('priceMin').addEventListener('change', updatePriceState);
+document.getElementById('priceMax').addEventListener('change', updatePriceState);
+
+// ===== SUPERFICIE SLIDER: GESTIONE ROBUSTA =====
+let surfaceDebounce = null;
+document.getElementById('surfaceMin').addEventListener('input', e => {
+  const val = +e.target.value;
+  document.getElementById('surfOut').textContent = val ? val + '+ m²' : 'qualsiasi';
+  clearTimeout(surfaceDebounce);
+  surfaceDebounce = setTimeout(() => {
+    state.surfaceMin = val;
+    apply();
+  }, 300);
 });
 
 document.getElementById('segContract').onclick=e=>{
@@ -941,20 +959,25 @@ function setView(v){
 }
 
 document.getElementById('btnReset').onclick=()=>{
-  Object.assign(state,{
-    typs:new Set(),priceMin:null,priceMax:null,surfaceMin:0,
-    roomsMin:0,bathsMin:0,floor:null,energys:new Set(),
-    feats:new Set(),status:new Set(),
-    onlyPhotos:false,onlyDeals:false,onlyNew:false,favOnly:false
-  });
-  state.portals=new Set(PORTALS.map(p=>p.id));
-  document.getElementById('priceMin').value='';
-  document.getElementById('priceMax').value='';
-  document.getElementById('surfaceMin').value=0;
-  document.getElementById('surfOut').textContent='qualsiasi';
-  buildTypoChips();buildRoomsChips();buildBathsChips();buildFloorChips();
-  buildEnergyChips();buildFeatChips();buildStatusChips();buildPortalChips();syncOptions();
-  apply();
+  isApplying = true;
+  try {
+    Object.assign(state,{
+      typs:new Set(),priceMin:null,priceMax:null,surfaceMin:0,
+      roomsMin:0,bathsMin:0,floor:null,energys:new Set(),
+      feats:new Set(),status:new Set(),
+      onlyPhotos:false,onlyDeals:false,onlyNew:false,favOnly:false
+    });
+    state.portals=new Set(PORTALS.map(p=>p.id));
+    document.getElementById('priceMin').value='';
+    document.getElementById('priceMax').value='';
+    document.getElementById('surfaceMin').value=0;
+    document.getElementById('surfOut').textContent='qualsiasi';
+    buildTypoChips();buildRoomsChips();buildBathsChips();buildFloorChips();
+    buildEnergyChips();buildFeatChips();buildStatusChips();buildPortalChips();syncOptions();
+    apply();
+  } finally {
+    isApplying = false;
+  }
 };
 
 /* ============== FILTRI + SORT ============== */
@@ -1052,36 +1075,42 @@ function bestRelax(){
 }
 
 function apply(){
-  const shown=sortList(rawFilter());
-  countUp(document.getElementById('bigCount'),shown.length);
-  document.getElementById('subCount').textContent=
-    `${state.contract==='vendita'?'Vendita':'Affitto'} · ${state.loc.label} · ${state.portals.size} portali · ${isLive?'LIVE':'DEMO'}`;
-  if(shown.length){
-    const avg=shown.reduce((s,l)=>s+l.price,0)/shown.length;
-    const withPpm=shown.filter(l=>l.ppm);
-    const avgPpm=withPpm.length?withPpm.reduce((s,l)=>s+l.ppm,0)/withPpm.length:null;
-    const min=Math.min(...shown.map(l=>l.price)),max=Math.max(...shown.map(l=>l.price));
-    document.getElementById('stats').innerHTML=
-      `<span class="stat">Media <b>€${fmt.format(Math.round(avg))}${state.contract==='affitto'?'/mese':''}</b></span>`+
-      (avgPpm?`<span class="stat">€/m² medio <b>${fmt.format(Math.round(avgPpm))}</b></span>`:'')+
-      `<span class="stat">Range <b>€${fmt.format(min)} – €${fmt.format(max)}</b></span>`+
-      `<span class="stat">Fonte <b>${isLive?'live':'demo'}</b></span>`;
-  }else document.getElementById('stats').innerHTML='';
-  const hint=document.getElementById('hint');
-  if(state.contract==='vendita'&&state.priceMax&&shown.length<8){
-    hint.innerHTML=`💡 Troppo restrittivo: prova ad alzare il prezzo massimo o ridurre i filtri.`;
-    hint.classList.add('show');
-  }else hint.classList.remove('show');
-  document.getElementById('favPill').textContent=`♥ ${favs.size}`;
-  syncOptions();
-  render();
-  const empty=document.getElementById('empty');
-  if(!shown.length){
-    empty.style.display='block';
-    const best=bestRelax(),btn=document.getElementById('smartFix');
-    if(best){btn.style.display='inline-block';btn.textContent=`💡 Rimuovi "${best.l}" → ${best.n} annunci`;btn.onclick=()=>{best.s();apply()}}
-    else{btn.style.display='none'}
-  }else empty.style.display='none';
+  if (isApplying) return;
+  isApplying = true;
+  try {
+    const shown=sortList(rawFilter());
+    countUp(document.getElementById('bigCount'),shown.length);
+    document.getElementById('subCount').textContent=
+      `${state.contract==='vendita'?'Vendita':'Affitto'} · ${state.loc.label} · ${state.portals.size} portali · ${isLive?'LIVE':'DEMO'}`;
+    if(shown.length){
+      const avg=shown.reduce((s,l)=>s+l.price,0)/shown.length;
+      const withPpm=shown.filter(l=>l.ppm);
+      const avgPpm=withPpm.length?withPpm.reduce((s,l)=>s+l.ppm,0)/withPpm.length:null;
+      const min=Math.min(...shown.map(l=>l.price)),max=Math.max(...shown.map(l=>l.price));
+      document.getElementById('stats').innerHTML=
+        `<span class="stat">Media <b>€${fmt.format(Math.round(avg))}${state.contract==='affitto'?'/mese':''}</b></span>`+
+        (avgPpm?`<span class="stat">€/m² medio <b>${fmt.format(Math.round(avgPpm))}</b></span>`:'')+
+        `<span class="stat">Range <b>€${fmt.format(min)} – €${fmt.format(max)}</b></span>`+
+        `<span class="stat">Fonte <b>${isLive?'live':'demo'}</b></span>`;
+    }else document.getElementById('stats').innerHTML='';
+    const hint=document.getElementById('hint');
+    if(state.contract==='vendita'&&state.priceMax&&shown.length<8){
+      hint.innerHTML=`💡 Troppo restrittivo: prova ad alzare il prezzo massimo o ridurre i filtri.`;
+      hint.classList.add('show');
+    }else hint.classList.remove('show');
+    document.getElementById('favPill').textContent=`♥ ${favs.size}`;
+    syncOptions();
+    render();
+    const empty=document.getElementById('empty');
+    if(!shown.length){
+      empty.style.display='block';
+      const best=bestRelax(),btn=document.getElementById('smartFix');
+      if(best){btn.style.display='inline-block';btn.textContent=`💡 Rimuovi "${best.l}" → ${best.n} annunci`;btn.onclick=()=>{best.s();apply()}}
+      else{btn.style.display='none'}
+    }else empty.style.display='none';
+  } finally {
+    isApplying = false;
+  }
 }
 
 function render(){
@@ -1111,7 +1140,6 @@ function ensureMap(){
 function renderMap(shown){
   ensureMap();
   markers.clearLayers();
-  // Se abbiamo coordinate degli annunci li piazziamo sulla mappa, altrimenti li generiamo attorno al centro
   const r=mulberry32(strSeed(state.loc.label));
   shown.forEach(l=>{
     let lat=l.lat,lon=l.lon;
@@ -1279,7 +1307,13 @@ function buildPresets(){
   ];
   document.getElementById('presets').innerHTML=P.map((p,i)=>`<button class="qchip" data-i="${i}">${p[0]}</button>`).join('');
   document.querySelectorAll('.qchip').forEach(b=>b.onclick=()=>{
-    P[+b.dataset.i][1](state);apply();
+    isApplying = true;
+    try {
+      P[+b.dataset.i][1](state);
+      apply();
+    } finally {
+      isApplying = false;
+    }
   });
 }
 
